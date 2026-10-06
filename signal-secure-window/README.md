@@ -1,5 +1,7 @@
 # Signal Secure Window
 
+> **Windows?** → siehe [`windows/`](windows/README.md) (PowerShell + VeraCrypt).
+
 Ein „sicheres Fenster“ für **Signal Desktop unter Linux**: Signal läuft in einer
 Sandbox, und sein komplettes Profil (Chats, Schlüssel, Anhänge, Einstellungen)
 liegt in einem verschlüsselten Tresor. **Entschlüsselt wird nur, solange Signal
