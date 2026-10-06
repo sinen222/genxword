@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+# signal-secure-window – startet Signal Desktop in einer Sandbox, deren
+# Profil (Chats, Schlüssel, Anhänge) in einem verschlüsselten Tresor liegt.
+#
+# Der Tresor wird nur für die Laufzeit von Signal entschlüsselt eingehängt:
+#   Start   -> Passwort abfragen, Tresor einhängen, Signal in bwrap starten
+#   Ende    -> Signal beenden, Tresor aushängen (Daten wieder nur verschlüsselt)
+# Optional wird Signal zusätzlich bei Bildschirmsperre oder Inaktivität beendet.
+#
+# Abhängigkeiten: bash, gocryptfs, fuse3 (fusermount3), bubblewrap (bwrap)
+# Optional:       xdg-dbus-proxy, dbus-monitor, xprintidle, zenity/kdialog
+# shellcheck disable=SC2015,SC2174  # bewusste Kurzformen; Rechte werden danach gesetzt
+set -euo pipefail
+
+VERSION=0.1.0
+PROG=${0##*/}
+
+VAULT_DIR=${SSW_VAULT_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/signal-secure-window}
+CIPHER_DIR=$VAULT_DIR/cipher
+SIGNAL_PROFILE=${SSW_SIGNAL_PROFILE:-${XDG_CONFIG_HOME:-$HOME/.config}/Signal}
+SIGNAL_BIN=${SSW_SIGNAL_BIN:-}
+
+if [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR ]]; then
+    STATE_DIR=$XDG_RUNTIME_DIR/signal-secure-window
+else
+    STATE_DIR=/tmp/signal-secure-window-$UID
+fi
+PLAIN_DIR=$STATE_DIR/plain
+LOCK_FILE=$STATE_DIR/lock
+PID_FILE=$STATE_DIR/pid
+INFO_FILE=$STATE_DIR/bwrap-info.json
+PROXY_SOCK=$STATE_DIR/bus
+
+# Laufzeit-Zustand (für Aufräumen)
+BWRAP_PID=
+SANDBOX_INIT_PID=
+PROXY_PID=
+WATCHER_PIDS=()
+STOP_REASON=
+
+# --------------------------------------------------------------------------
+# Hilfsfunktionen
+# --------------------------------------------------------------------------
+
+log()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { log "Fehler: $*"; notify "$*"; exit 1; }
+
+notify() {
+    [[ -t 2 ]] && return 0
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send -a Signal "Signal Secure Window" "$*" 9>&- 2>/dev/null || true
+}
+
+require() {
+    local c
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || die "'$c' wird benötigt, ist aber nicht installiert."
+    done
+}
+
+fusermount_cmd() {
+    if command -v fusermount3 >/dev/null 2>&1; then echo fusermount3; else echo fusermount; fi
+}
+
+is_mounted() {
+    local mp
+    mp=$(realpath -m "$1")
+    awk -v mp="$mp" '$5 == mp { found = 1 } END { exit !found }' /proc/self/mountinfo
+}
+
+vault_exists() { [[ -f $CIPHER_DIR/gocryptfs.conf ]]; }
+
+prepare_state_dir() {
+    mkdir -p -m 700 "$STATE_DIR"
+    [[ -O $STATE_DIR ]] || die "$STATE_DIR gehört nicht dir – Abbruch."
+    chmod 700 "$STATE_DIR"
+    mkdir -p -m 700 "$PLAIN_DIR"
+}
+
+find_signal_bin() {
+    if [[ -n $SIGNAL_BIN ]]; then
+        [[ -x $SIGNAL_BIN ]] || die "SSW_SIGNAL_BIN=$SIGNAL_BIN ist nicht ausführbar."
+        return
+    fi
+    local c
+    for c in /opt/Signal/signal-desktop /opt/Signal/signal-desktop-beta \
+             "$(command -v signal-desktop 2>/dev/null || true)"; do
+        if [[ -n $c && -x $c ]]; then
+            SIGNAL_BIN=$(realpath "$c")
+            return
+        fi
+    done
+    die "Signal Desktop nicht gefunden. Setze SSW_SIGNAL_BIN=/pfad/zu/signal-desktop."
+}
+
+# Läuft irgendwo eine ungeschützte Signal-Instanz?
+signal_running_unprotected() {
+    pgrep -u "$UID" -x signal-desktop >/dev/null 2>&1 ||
+        pgrep -u "$UID" -f '/opt/Signal/signal-desktop' >/dev/null 2>&1
+}
+
+# Platzhalter am ursprünglichen Profilort: leer und ohne Rechte, damit ein
+# versehentlich ungeschützt gestartetes Signal kein neues Klartext-Profil anlegt.
+make_placeholder() {
+    mkdir -p "$SIGNAL_PROFILE"
+    chmod 000 "$SIGNAL_PROFILE"
+}
+
+# --------------------------------------------------------------------------
+# Tresor ein-/aushängen
+# --------------------------------------------------------------------------
+
+mount_vault() {
+    vault_exists || die "Kein Tresor gefunden. Erst '$PROG init' ausführen."
+    prepare_state_dir
+    is_mounted "$PLAIN_DIR" && return 0
+
+    local -a pass=()
+    if [[ ! -t 0 ]]; then
+        # Kein Terminal (z. B. Start über Desktop-Eintrag): grafische Abfrage
+        if command -v zenity >/dev/null 2>&1; then
+            pass=(-extpass zenity -extpass --password -extpass --title=Signal-Tresor)
+        elif command -v kdialog >/dev/null 2>&1; then
+            pass=(-extpass kdialog -extpass --password -extpass "Signal-Tresor entsperren")
+        elif command -v systemd-ask-password >/dev/null 2>&1; then
+            pass=(-extpass systemd-ask-password -extpass "Signal-Tresor:")
+        else
+            die "Kein Terminal und kein Passwort-Dialog (zenity/kdialog) verfügbar."
+        fi
+    fi
+
+    local rc=0
+    # -noprealloc: schont SSDs; Tresor ist nur für den eigenen Benutzer sichtbar
+    gocryptfs -q -nosyslog -noprealloc "${pass[@]}" "$CIPHER_DIR" "$PLAIN_DIR" 9>&- || rc=$?
+    case $rc in
+        0)  ;;
+        12) die "Falsches Passwort." ;;
+        *)  die "Tresor konnte nicht eingehängt werden (gocryptfs Code $rc)." ;;
+    esac
+}
+
+unmount_vault() {
+    is_mounted "$PLAIN_DIR" || return 0
+    local fm
+    fm=$(fusermount_cmd)
+    sync
+    for _ in $(seq 1 20); do
+        "$fm" -u "$PLAIN_DIR" 2>/dev/null && { log "Tresor gesperrt."; return 0; }
+        sleep 0.5
+    done
+    log "Warnung: Tresor ist noch in Benutzung – hänge verzögert aus (lazy)."
+    "$fm" -u -z "$PLAIN_DIR" || log "Fehler: Tresor konnte nicht ausgehängt werden!"
+}
+
+# --------------------------------------------------------------------------
+# Sandbox
+# --------------------------------------------------------------------------
+
+start_dbus_proxy() {
+    [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] || return 1
+    command -v xdg-dbus-proxy >/dev/null 2>&1 || return 1
+    rm -f "$PROXY_SOCK"
+    # Nur das Nötigste erlauben: Benachrichtigungen, Schlüsselbund, Tray, Portale
+    xdg-dbus-proxy "$DBUS_SESSION_BUS_ADDRESS" "$PROXY_SOCK" --filter \
+        --talk=org.freedesktop.Notifications \
+        --talk=org.freedesktop.secrets \
+        --talk=org.kde.kwalletd5 \
+        --talk=org.kde.kwalletd6 \
+        --talk=org.kde.StatusNotifierWatcher \
+        --talk=org.freedesktop.portal.Desktop \
+        --talk=org.freedesktop.portal.FileChooser \
+        --own='org.kde.StatusNotifierItem-*' \
+        9>&- &
+    PROXY_PID=$!
+
+    for _ in $(seq 1 50); do
+        [[ -S $PROXY_SOCK ]] && return 0
+        sleep 0.1
+    done
+    log "Warnung: xdg-dbus-proxy startete nicht – fahre ohne D-Bus fort."
+    kill "$PROXY_PID" 2>/dev/null || true
+    PROXY_PID=
+    return 1
+}
+
+# Füllt das Array BWRAP_ARGS
+build_sandbox() {
+    local dbus_mode=$1 downloads=$2
+    local rt=${XDG_RUNTIME_DIR:-/run/user/$UID}
+    local d
+
+    BWRAP_ARGS=(
+        --unshare-all --share-net
+        --die-with-parent --new-session
+        --proc /proc
+        --dev /dev
+        --tmpfs /dev/shm
+        --tmpfs /tmp
+        --tmpfs /run
+        --tmpfs /var
+        --dir "$rt"
+        --tmpfs "$HOME"
+        --clearenv
+        --setenv HOME "$HOME"
+        --setenv USER "${USER:-$(id -un)}"
+        --setenv PATH /usr/local/bin:/usr/bin:/bin
+        --setenv XDG_RUNTIME_DIR "$rt"
+        --setenv XDG_CONFIG_HOME "$HOME/.config"
+    )
+
+    # Systemverzeichnisse nur lesend
+    for d in /usr /bin /sbin /lib /lib32 /lib64 /libx32 /etc /opt /sys; do
+        if [[ -L $d ]]; then
+            BWRAP_ARGS+=(--symlink "$(readlink "$d")" "$d")
+        elif [[ -d $d ]]; then
+            BWRAP_ARGS+=(--ro-bind "$d" "$d")
+        fi
+    done
+    # Signal außerhalb von /usr und /opt installiert?
+    case $SIGNAL_BIN in
+        /usr/*|/opt/*) ;;
+        *) BWRAP_ARGS+=(--ro-bind "$(dirname "$SIGNAL_BIN")" "$(dirname "$SIGNAL_BIN")") ;;
+    esac
+    # DNS bei systemd-resolved (resolv.conf zeigt nach /run)
+    BWRAP_ARGS+=(--ro-bind-try /run/systemd/resolve /run/systemd/resolve)
+
+    # Hardware: GPU, Audio, Kamera (für Anrufe)
+    BWRAP_ARGS+=(--dev-bind-try /dev/dri /dev/dri --dev-bind-try /dev/snd /dev/snd)
+    for d in /dev/video*; do
+        [[ -e $d ]] && BWRAP_ARGS+=(--dev-bind "$d" "$d")
+    done
+
+    # Umgebung durchreichen
+    for d in LANG LANGUAGE LC_ALL LC_MESSAGES LC_TIME TZ XDG_SESSION_TYPE \
+             XDG_CURRENT_DESKTOP DESKTOP_SESSION GTK_THEME QT_QPA_PLATFORMTHEME; do
+        [[ -n ${!d:-} ]] && BWRAP_ARGS+=(--setenv "$d" "${!d}")
+    done
+
+    # Anzeige: Wayland und/oder X11
+    if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+        local wl=$WAYLAND_DISPLAY
+        [[ $wl == /* ]] || wl=$rt/$wl
+        if [[ -S $wl ]]; then
+            BWRAP_ARGS+=(--ro-bind "$wl" "$rt/wayland-0" --setenv WAYLAND_DISPLAY wayland-0)
+        fi
+    fi
+    if [[ -n ${DISPLAY:-} ]]; then
+        local n=${DISPLAY#*:}; n=${n%%.*}
+        BWRAP_ARGS+=(--setenv DISPLAY "$DISPLAY")
+        [[ -S /tmp/.X11-unix/X$n ]] &&
+            BWRAP_ARGS+=(--ro-bind "/tmp/.X11-unix/X$n" "/tmp/.X11-unix/X$n")
+        local xa=${XAUTHORITY:-$HOME/.Xauthority}
+        if [[ -f $xa ]]; then
+            BWRAP_ARGS+=(--ro-bind "$xa" "$HOME/.Xauthority" --setenv XAUTHORITY "$HOME/.Xauthority")
+        fi
+    fi
+
+    # Audio: PulseAudio / PipeWire
+    [[ -S $rt/pulse/native ]] &&
+        BWRAP_ARGS+=(--ro-bind "$rt/pulse/native" "$rt/pulse/native")
+    [[ -S $rt/pipewire-0 ]] &&
+        BWRAP_ARGS+=(--ro-bind "$rt/pipewire-0" "$rt/pipewire-0")
+
+    # Darstellung: Schriften, Icons, GTK-Einstellungen (nur lesend)
+    for d in .fonts .local/share/fonts .config/fontconfig .icons .local/share/icons \
+             .themes .config/gtk-3.0 .config/gtk-4.0 .config/kdeglobals; do
+        BWRAP_ARGS+=(--ro-bind-try "$HOME/$d" "$HOME/$d")
+    done
+
+    # D-Bus
+    case $dbus_mode in
+        filtered)
+            if start_dbus_proxy; then
+                BWRAP_ARGS+=(--bind "$PROXY_SOCK" "$rt/bus"
+                             --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$rt/bus")
+            fi
+            ;;
+        full)
+            log "Warnung: Voller D-Bus-Zugriff schwächt die Sandbox erheblich."
+            local sock=${DBUS_SESSION_BUS_ADDRESS#unix:path=}
+            sock=${sock%%,*}
+            if [[ -S $sock ]]; then
+                BWRAP_ARGS+=(--bind "$sock" "$rt/bus"
+                             --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$rt/bus")
+            else
+                log "Warnung: D-Bus-Socket nicht gefunden – fahre ohne D-Bus fort."
+            fi
+            ;;
+        none) ;;
+    esac
+
+    # Downloads-Ordner für Anhänge (einziger beschreibbarer Ort außer dem Profil)
+    if [[ -n $downloads ]]; then
+        mkdir -p "$downloads"
+        BWRAP_ARGS+=(--bind "$downloads" "$downloads")
+    fi
+
+    # Das entschlüsselte Profil – erscheint in der Sandbox am gewohnten Ort
+    BWRAP_ARGS+=(--bind "$PLAIN_DIR" "$SIGNAL_PROFILE")
+}
+
+# Beendet Signal in der Sandbox: erst höflich (TERM), dann hart (KILL).
+stop_sandbox() {
+    [[ -n $BWRAP_PID ]] && kill -0 "$BWRAP_PID" 2>/dev/null || return 0
+    if [[ -n $SANDBOX_INIT_PID ]]; then
+        pkill -TERM --ns "$SANDBOX_INIT_PID" --nslist pid 2>/dev/null || true
+    fi
+
+    for _ in $(seq 1 30); do
+        kill -0 "$BWRAP_PID" 2>/dev/null || return 0
+        sleep 0.5
+    done
+    log "Signal reagiert nicht – erzwinge Beenden."
+    [[ -n $SANDBOX_INIT_PID ]] && kill -KILL "$SANDBOX_INIT_PID" 2>/dev/null
+    kill -KILL "$BWRAP_PID" 2>/dev/null || true
+}
+
+request_stop() {
+    STOP_REASON=$1
+    log "$1 – schließe Signal und sperre den Tresor."
+    stop_sandbox
+}
+
+# Schließt Signal, sobald der Bildschirm gesperrt wird.
+watch_screenlock() {
+    command -v dbus-monitor >/dev/null 2>&1 || {
+        log "Hinweis: dbus-monitor fehlt – keine Sperre bei Bildschirmsperre."
+        return 0
+    }
+    [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] || return 0
+    (
+        dbus-monitor --session \
+            "type='signal',interface='org.freedesktop.ScreenSaver',member='ActiveChanged'" \
+            "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'" \
+            "type='signal',interface='org.cinnamon.ScreenSaver',member='ActiveChanged'" \
+            "type='signal',interface='org.mate.ScreenSaver',member='ActiveChanged'" \
+            2>/dev/null |
+        while read -r line; do
+            if [[ $line == *"boolean true"* ]]; then
+                kill -USR1 "$$"
+                break
+            fi
+        done
+    ) 9>&- &
+    WATCHER_PIDS+=($!)
+}
+
+# Schließt Signal nach N Minuten ohne Eingabe (nur X11, braucht xprintidle).
+watch_idle() {
+    local minutes=$1
+    [[ $minutes -gt 0 ]] || return 0
+    command -v xprintidle >/dev/null 2>&1 || {
+        log "Hinweis: xprintidle fehlt – --idle wird ignoriert."
+        return 0
+    }
+    (
+        local limit=$((minutes * 60000)) idle
+        while sleep 20; do
+            idle=$(xprintidle 2>/dev/null) || continue
+            if [[ $idle -ge $limit ]]; then
+                kill -USR2 "$$"
+                break
+            fi
+        done
+    ) 9>&- &
+    WATCHER_PIDS+=($!)
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM HUP USR1 USR2
+    stop_sandbox
+    local p
+    for p in "${WATCHER_PIDS[@]}"; do
+        pkill -P "$p" 2>/dev/null || true
+        kill "$p" 2>/dev/null || true
+    done
+    [[ -n $PROXY_PID ]] && kill "$PROXY_PID" 2>/dev/null
+    rm -f "$PROXY_SOCK" "$INFO_FILE" "$PID_FILE"
+    unmount_vault
+    [[ -n $STOP_REASON ]] && notify "Signal wurde geschlossen ($STOP_REASON). Tresor gesperrt."
+    exit "$rc"
+}
+
+# --------------------------------------------------------------------------
+# Befehle
+# --------------------------------------------------------------------------
+
+cmd_run() {
+    local dbus_mode=filtered screenlock=1 idle=0 chromium_sandbox=1
+    local downloads=${XDG_DOWNLOAD_DIR:-$HOME/Downloads}
+    local -a signal_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dbus)          dbus_mode=${2:?}; shift ;;
+            --dbus=*)        dbus_mode=${1#*=} ;;
+            --no-screenlock) screenlock=0 ;;
+            --idle)          idle=${2:?}; shift ;;
+            --idle=*)        idle=${1#*=} ;;
+            --downloads)     downloads=${2?}; shift ;;
+            --downloads=*)   downloads=${1#*=} ;;
+            --no-downloads)  downloads= ;;
+            --no-chromium-sandbox) chromium_sandbox=0 ;;
+            --)              shift; signal_args+=("$@"); break ;;
+            *)               signal_args+=("$1") ;;
+        esac
+        shift
+    done
+    case $dbus_mode in filtered|full|none) ;; *) die "--dbus: filtered|full|none" ;; esac
+    [[ $idle =~ ^[0-9]+$ ]] || die "--idle erwartet Minuten (Zahl)."
+
+    require gocryptfs bwrap pkill
+    find_signal_bin
+    prepare_state_dir
+
+    # Nur eine Instanz: ein zweites Signal auf demselben Profil wäre gefährlich
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        notify "Signal läuft bereits im Secure Window."
+        log "Signal läuft bereits im Secure Window."
+        exit 0
+    fi
+    echo $$ >"$PID_FILE"
+
+    signal_running_unprotected &&
+        die "Signal läuft bereits außerhalb der Sandbox. Bitte erst beenden."
+
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 129' HUP
+    trap 'request_stop "Sperre angefordert"' TERM
+    trap 'request_stop "Bildschirm gesperrt"' USR1
+    trap 'request_stop "Inaktivität"' USR2
+
+    mount_vault
+    log "Tresor entsperrt."
+
+    build_sandbox "$dbus_mode" "$downloads"
+
+    (( chromium_sandbox )) || {
+        log "Warnung: Chromium-Sandbox deaktiviert."
+        signal_args=(--no-sandbox "${signal_args[@]}")
+    }
+
+    rm -f "$INFO_FILE"
+    bwrap "${BWRAP_ARGS[@]}" --info-fd 8 \
+        "$SIGNAL_BIN" "${signal_args[@]}" 8>"$INFO_FILE" 9>&- &
+    BWRAP_PID=$!
+
+    for _ in $(seq 1 50); do
+        SANDBOX_INIT_PID=$(grep -o '"child-pid": *[0-9]*' "$INFO_FILE" 2>/dev/null |
+                           grep -o '[0-9]*$' || true)
+        [[ -n $SANDBOX_INIT_PID ]] && break
+        kill -0 "$BWRAP_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+
+    (( screenlock )) && watch_screenlock
+    watch_idle "$idle"
+
+    # Warten bis Signal endet. "wait" kehrt bei Signalen (USR1/USR2) vorzeitig
+    # zurück, daher in einer Schleife.
+    local rc=0
+    while kill -0 "$BWRAP_PID" 2>/dev/null; do
+        wait "$BWRAP_PID" && rc=0 || rc=$?
+    done
+    BWRAP_PID=
+    log "Signal beendet."
+    return "$rc"
+}
+
+cmd_init() {
+    require gocryptfs
+    vault_exists && die "Tresor existiert bereits in $CIPHER_DIR."
+    [[ -t 0 ]] || die "'init' muss in einem Terminal ausgeführt werden."
+    signal_running_unprotected && die "Bitte Signal vor der Einrichtung beenden."
+
+    mkdir -p -m 700 "$VAULT_DIR" "$CIPHER_DIR"
+    chmod 700 "$VAULT_DIR"
+    log "Lege verschlüsselten Tresor an: $CIPHER_DIR"
+    log "WICHTIG: Den angezeigten Master-Key sicher (offline) aufbewahren!"
+    gocryptfs -init "$CIPHER_DIR"
+
+    prepare_state_dir
+    if [[ -d $SIGNAL_PROFILE && -r $SIGNAL_PROFILE ]] &&
+       [[ -n $(ls -A "$SIGNAL_PROFILE" 2>/dev/null) ]]; then
+        log "Vorhandenes Signal-Profil gefunden: $SIGNAL_PROFILE"
+        log "Es wird in den Tresor übernommen (Passwort erneut eingeben)."
+        mount_vault
+        trap unmount_vault EXIT
+        cp -a "$SIGNAL_PROFILE/." "$PLAIN_DIR/"
+        if ! diff -rq --no-dereference "$SIGNAL_PROFILE" "$PLAIN_DIR" >/dev/null; then
+            die "Kopie stimmt nicht mit dem Original überein – Original bleibt unverändert."
+        fi
+        unmount_vault
+        trap - EXIT
+        log "Profil erfolgreich in den Tresor kopiert."
+
+        local answer
+        read -r -p "Unverschlüsseltes Original jetzt löschen? [j/N] " answer
+        if [[ $answer =~ ^[jJyY] ]]; then
+            if command -v shred >/dev/null 2>&1; then
+                find "$SIGNAL_PROFILE" -type f -exec shred -u -z -n 1 {} + 2>/dev/null || true
+            fi
+            rm -rf "$SIGNAL_PROFILE"
+            log "Original gelöscht. Hinweis: Auf SSDs/CoW-Dateisystemen kann"
+            log "'shred' nicht garantieren, dass alte Blöcke unlesbar sind."
+        else
+            local backup
+            backup="$SIGNAL_PROFILE.unverschluesselt.$(date +%Y%m%d%H%M%S)"
+            mv "$SIGNAL_PROFILE" "$backup"
+            log "Original verschoben nach $backup – bitte selbst sicher löschen."
+        fi
+    fi
+    make_placeholder
+    log "Fertig. Signal ab jetzt mit '$PROG' starten (oder '$PROG install-desktop')."
+}
+
+cmd_lock() {
+    if [[ -f $PID_FILE ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        kill -TERM "$(cat "$PID_FILE")"
+        log "Sperranforderung gesendet."
+    else
+        unmount_vault
+    fi
+}
+
+cmd_status() {
+    echo "Tresor:       $CIPHER_DIR $(vault_exists && echo '(vorhanden)' || echo '(fehlt)')"
+    echo "Profilpfad:   $SIGNAL_PROFILE (in der Sandbox)"
+    if is_mounted "$PLAIN_DIR"; then
+        echo "Zustand:      ENTSPERRT (eingehängt unter $PLAIN_DIR)"
+    else
+        echo "Zustand:      gesperrt"
+    fi
+    if [[ -f $PID_FILE ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "Signal:       läuft im Secure Window (PID $(cat "$PID_FILE"))"
+    elif signal_running_unprotected; then
+        echo "Signal:       läuft UNGESCHÜTZT außerhalb der Sandbox!"
+    else
+        echo "Signal:       beendet"
+    fi
+}
+
+cmd_passwd() {
+    require gocryptfs
+    vault_exists || die "Kein Tresor gefunden."
+    is_mounted "$PLAIN_DIR" && die "Bitte Signal erst beenden."
+    gocryptfs -passwd "$CIPHER_DIR"
+}
+
+cmd_install_desktop() {
+    local self apps
+    self=$(realpath "$0")
+    apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+    mkdir -p "$apps"
+    # Gleicher Dateiname wie der Eintrag des Signal-Pakets -> überdeckt diesen
+    cat >"$apps/signal-desktop.desktop" <<EOF
+[Desktop Entry]
+Name=Signal (Secure Window)
+Comment=Signal in einer Sandbox mit verschlüsseltem Profil
+Exec=$self run %U
+Terminal=false
+Type=Application
+Icon=signal-desktop
+StartupWMClass=signal
+MimeType=x-scheme-handler/sgnl;x-scheme-handler/signalcaptcha;
+Categories=Network;InstantMessaging;Chat;
+EOF
+    command -v update-desktop-database >/dev/null 2>&1 &&
+        update-desktop-database "$apps" 2>/dev/null || true
+    log "Desktop-Eintrag installiert: $apps/signal-desktop.desktop"
+    log "Hinweis: Autostart-Einträge von Signal ggf. ebenfalls anpassen."
+}
+
+usage() {
+    cat <<EOF
+$PROG $VERSION – Signal Desktop in einer Sandbox mit verschlüsseltem Profil
+
+Aufruf: $PROG [befehl] [optionen] [-- signal-argumente]
+
+Befehle:
+  run (Standard)     Tresor entsperren, Signal in Sandbox starten,
+                     nach dem Beenden Tresor wieder sperren
+  init               Tresor anlegen und vorhandenes Profil übernehmen
+  lock               Signal schließen und Tresor sofort sperren
+  status             Zustand anzeigen
+  passwd             Tresor-Passwort ändern
+  install-desktop    Startmenü-Eintrag von Signal durch Secure Window ersetzen
+
+Optionen für 'run':
+  --dbus MODUS       filtered (Standard, braucht xdg-dbus-proxy) | full | none
+  --idle MINUTEN     Signal nach MINUTEN Inaktivität schließen (X11, xprintidle)
+  --no-screenlock    Signal bei Bildschirmsperre NICHT schließen
+  --downloads DIR    Beschreibbarer Ordner für Anhänge (Standard: ~/Downloads)
+  --no-downloads     Keinen Ordner freigeben
+  --no-chromium-sandbox
+                     Electron-interne Sandbox abschalten (nur falls Signal
+                     sonst nicht startet; bwrap-Sandbox bleibt aktiv)
+
+Umgebungsvariablen:
+  SSW_VAULT_DIR, SSW_SIGNAL_PROFILE, SSW_SIGNAL_BIN
+EOF
+}
+
+main() {
+    local cmd=${1:-run}
+    case $cmd in
+        run)              shift || true; cmd_run "$@" ;;
+        init)             cmd_init ;;
+        lock)             cmd_lock ;;
+        status)           cmd_status ;;
+        passwd)           cmd_passwd ;;
+        install-desktop)  cmd_install_desktop ;;
+        -h|--help|help)   usage ;;
+        --version)        echo "$VERSION" ;;
+        -*)               cmd_run "$@" ;;
+        *)                usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"
